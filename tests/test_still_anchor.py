@@ -123,6 +123,7 @@ class StillAnchorTest(unittest.TestCase):
         item = bridge.load_still_bundle(self.store)[0]
         task = bridge.still_task(self.store, item)
         self.assertEqual(task["kind"], bridge.STILL_KIND)
+        self.assertEqual(task["id"], "locked_still_char_lin_front")
         self.assertEqual(task["expected_path"], "assets/anchors/char_lin_ya_front_full.png")
         self.assertEqual(task["depends_on"], [])
         self.assertEqual(task["payload"]["media"], "image")

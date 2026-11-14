@@ -174,7 +174,7 @@ def still_task(store: ProjectStore, item: dict[str, Any]) -> dict[str, Any]:
 
     job = item["job"]
     return {
-        "id": f"still_{job['job_id']}",
+        "id": f"locked_{job['job_id']}",  # same prefix as video tasks; job ids already start with still_
         "job_id": job["job_id"],
         "job_path": store.relative(item["path"]),
         "job_sha256": item["canonical_sha256"],
