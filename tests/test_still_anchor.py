@@ -23,6 +23,7 @@ except FileNotFoundError:
 
 if SKILL_AVAILABLE:
     from drama_pipeline import media_contract_bridge as bridge
+    from drama_pipeline.planner import locate_short_drama_skill
     from PIL import Image
 
 JOB = {
@@ -166,6 +167,27 @@ class StillAnchorTest(unittest.TestCase):
                 self.store, queue, task, self._png(), qc_passed=True, note="", cost=None, receipt_path=receipt
             )
         self.assertNotEqual(task["status"], "complete")
+
+    def test_skill_compiled_stills_load_in_the_kit(self):
+        """The skill's compiler output must satisfy the kit's loader, unchanged."""
+        import subprocess
+
+        skill = locate_short_drama_skill()
+        example = skill / "examples" / "production-pack.example.json"
+        out = self.root / "media-jobs" / "stills"
+        subprocess.run(
+            [sys.executable, str(skill / "scripts" / "still_job_compile.py"), str(example),
+             "--out", str(out), "--provider", "qwen", "--entrypoint", "comfyui",
+             "--model-id", "qwen-image-2.1", "--aspect-ratio", "3:4"],
+            check=True, capture_output=True,
+        )
+        self.pack = json.loads(example.read_text(encoding="utf-8"))
+        self.store = FakeStore(self.root, self.pack)
+        items = bridge.load_still_bundle(self.store)
+        self.assertEqual(len(items), 8)
+        tasks = [bridge.still_task(self.store, item) for item in items]
+        self.assertTrue(all(task["kind"] == bridge.STILL_KIND for task in tasks))
+        self.assertEqual(len({task["id"] for task in tasks}), 8)
 
 
 if __name__ == "__main__":
