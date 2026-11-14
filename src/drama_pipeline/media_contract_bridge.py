@@ -9,19 +9,29 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from .planner import locate_short_drama_skill
-from .store import ProjectStore, is_within, sha256_file
+from .store import ProjectStore, is_within, sha256_file, utc_now
 
 
 CONTRACT_VERSION = "1.0"
 MEDIA_JOB_DIR = "media-jobs"
 EXECUTION_MODE = "locked_media_jobs"
 _CONTRACT: Any | None = None
+_STILL: Any | None = None
+
+# Still Jobs (定妆图): the still-image stage before image-to-video.
+# Contract: ai-short-drama/scripts/still_job_lint.py. They live in
+# media-jobs/stills/ under a manifest and never carry shots or video output.
+STILL_DIR = "stills"
+STILL_KIND = "locked_still_job"
+STILL_CONTRACT = "ai-short-drama.still-job/1.0"
+STILL_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 
 
 def _contract_module() -> Any:
@@ -84,6 +94,207 @@ def self_test_contract_location() -> None:
             os.environ.pop("AI_SHORT_DRAMA_SKILL", None)
         else:
             os.environ["AI_SHORT_DRAMA_SKILL"] = previous
+
+
+def _still_module() -> Any:
+    global _STILL
+    if _STILL is not None:
+        return _STILL
+    source = locate_short_drama_skill() / "scripts" / "still_job_lint.py"
+    if not source.is_file():
+        raise RuntimeError(f"ai-short-drama still job linter is unavailable: {source}")
+    name = "_hao_ai_short_drama_still_job_lint"
+    spec = importlib.util.spec_from_file_location(name, source)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load still job linter: {source}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    _STILL = module
+    return module
+
+
+def _still_root(store: ProjectStore) -> Path:
+    return (store.root / MEDIA_JOB_DIR / STILL_DIR).resolve()
+
+
+def still_json_paths(store: ProjectStore) -> set[Path]:
+    """The manifest and every still job file; the closed-world check counts them."""
+
+    manifest = _still_root(store) / "manifest.json"
+    if not manifest.is_file():
+        return set()
+    raw = _read_json(manifest, "still manifest")
+    paths = {manifest.resolve()}
+    for entry in raw.get("jobs", []) if isinstance(raw.get("jobs"), list) else []:
+        if isinstance(entry, dict):
+            paths.add(_safe_manifest_file(_still_root(store), entry.get("file")))
+    return paths
+
+
+def load_still_bundle(store: ProjectStore) -> list[dict[str, Any]]:
+    """Load and lint every still job, in manifest order. Empty when the project has none."""
+
+    manifest = _still_root(store) / "manifest.json"
+    if not manifest.is_file():
+        return []
+    raw = _read_json(manifest, "still manifest")
+    if set(raw) != {"contract_version", "jobs"} or raw.get("contract_version") != CONTRACT_VERSION:
+        raise ValueError("still manifest must carry exactly contract_version and jobs")
+    if not isinstance(raw.get("jobs"), list):
+        raise ValueError("still manifest jobs must be a list")
+    contract = _contract_module()
+    still = _still_module()
+    budget = store.pack().get("project", {}).get("max_reference_assets")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw["jobs"], start=1):
+        if not isinstance(entry, dict) or set(entry) != {"job_id", "file", "canonical_sha256"}:
+            raise ValueError(f"still manifest.jobs[{index - 1}] has an invalid shape")
+        job_id = entry["job_id"]
+        if not isinstance(job_id, str) or not job_id or job_id in seen:
+            raise ValueError(f"still manifest contains an invalid or duplicate job_id: {job_id!r}")
+        seen.add(job_id)
+        path = _safe_manifest_file(_still_root(store), entry["file"])
+        job = _read_json(path, f"still job {job_id}")
+        if contract.canonical_sha256(job) != entry["canonical_sha256"]:
+            raise ValueError(f"still job {job_id} changed after the manifest was written")
+        if job.get("job_id") != job_id:
+            raise ValueError(f"still job file {path.name} does not carry job_id {job_id!r}")
+        report = still.lint_still_job(job, budget=budget)
+        if report.errors:
+            detail = "; ".join(f"{item.path}: {item.message}" for item in report.errors)
+            raise ValueError(f"still job {job_id} fails its contract: {detail}")
+        items.append({"index": index, "path": path, "job": job, "canonical_sha256": entry["canonical_sha256"]})
+    return items
+
+
+def still_task(store: ProjectStore, item: dict[str, Any]) -> dict[str, Any]:
+    """The queue row a still job compiles to. Only identity and payload are fixed here."""
+
+    job = item["job"]
+    return {
+        "id": f"still_{job['job_id']}",
+        "job_id": job["job_id"],
+        "job_path": store.relative(item["path"]),
+        "job_sha256": item["canonical_sha256"],
+        "kind": STILL_KIND,
+        "status": "pending",
+        "priority": 10 + int(item["index"]),
+        "depends_on": [],
+        "attempts": 0,
+        "max_attempts": int(job["retry_policy"]["max_attempts"]),
+        "expected_path": job["outputs"]["image_path"],
+        "accepted_extensions": list(STILL_EXTENSIONS),
+        "qc_required": True,
+        "payload": {
+            "execution_contract": STILL_CONTRACT,
+            "media": "image",
+            "job_path": store.relative(item["path"]),
+            "job_sha256": item["canonical_sha256"],
+            "entity_id": job["entity_id"],
+            "entity_kind": job["entity_kind"],
+            "view": job.get("view"),
+            "generation_target": job["generation_target"],
+            "prompt": job["prompt"],
+            "reference_files": list(job.get("reference_files", [])),
+            "locks": list(job["locks"]),
+            "outputs": job["outputs"],
+        },
+        "result": None,
+    }
+
+
+def verify_completed_still_task(store: ProjectStore, task: dict[str, Any]) -> None:
+    result = task.get("result") or {}
+    path = store.artifact(task["expected_path"])
+    if not path.is_file() or sha256_file(path) != result.get("image_sha256"):
+        raise ValueError(f"completed still task {task['id']} no longer matches its image")
+
+
+def validate_still_task(store: ProjectStore, task: Any, item: dict[str, Any]) -> None:
+    expected = still_task(store, item)
+    if not isinstance(task, dict):
+        raise ValueError(f"still queue task {expected['id']} must be an object")
+    for key, value in expected.items():
+        if key in {"status", "attempts", "result"}:
+            continue
+        if task.get(key) != value:
+            raise ValueError(f"still queue task {expected['id']} drifted from canonical field {key}")
+    allowed = set(expected) | {"attempts", "result", "started_at", "last_error"}
+    if set(task) - allowed:
+        raise ValueError(f"still queue task {expected['id']} has invalid keys {sorted(set(task) - allowed)}")
+    if task.get("status") not in {"pending", "running", "complete", "blocked"}:
+        raise ValueError(f"still queue task {expected['id']} has an invalid status")
+    attempts = task.get("attempts")
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= expected["max_attempts"]:
+        raise ValueError(f"still queue task {expected['id']} has invalid attempts")
+    if task.get("status") == "complete":
+        verify_completed_still_task(store, task)
+    elif task.get("result") is not None:
+        raise ValueError(f"incomplete still queue task {expected['id']} cannot carry a result")
+
+
+def complete_still_task(
+    store: ProjectStore,
+    queue: dict[str, Any],
+    task: dict[str, Any],
+    source: Path,
+    *,
+    qc_passed: bool,
+    note: str,
+    cost: float | None,
+    receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    """Persist one still anchor after QC: a readable image, bound to its job."""
+
+    if not qc_passed:
+        raise ValueError("Visual QC must pass before completing a still anchor")
+    if source.suffix.lower() not in task["accepted_extensions"]:
+        raise ValueError(f"still output must end in one of {sorted(task['accepted_extensions'])}")
+    from PIL import Image
+
+    try:
+        with Image.open(source) as image:
+            image.verify()
+        with Image.open(source) as image:
+            width, height = image.size
+            image_format = image.format
+    except Exception as exc:  # noqa: BLE001 - any decode failure is a rejection
+        raise ValueError(f"still output is not a readable image: {exc}") from exc
+    receipt_digest = None
+    if receipt_path is not None:
+        receipt = _read_json(receipt_path, "still receipt")
+        if receipt.get("job_id") != task["job_id"] or receipt.get("job_sha256") != task["job_sha256"]:
+            raise ValueError("still receipt does not bind to this job")
+        receipt_digest = sha256_file(receipt_path)
+    digest = sha256_file(source)
+    destination = store.artifact(task["expected_path"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and sha256_file(destination) != digest:
+        raise ValueError(f"{task['expected_path']} already holds a different image")
+    shutil.copyfile(source, destination)
+    if sha256_file(destination) != digest:
+        raise RuntimeError("persisted still hash changed during copy")
+    task["status"] = "complete"
+    task["result"] = {
+        "file": str(destination),
+        "image_sha256": digest,
+        "width": width,
+        "height": height,
+        "format": image_format,
+        "qc_passed": True,
+        "mock": False,
+        "note": note,
+        "cost": cost,
+        "job_path": task["job_path"],
+        "job_sha256": task["job_sha256"],
+        "receipt_sha256": receipt_digest,
+        "completed_at": utc_now(),
+    }
+    store.save_queue(queue)
+    store.log("locked_still_job_completed", {"task_id": task["id"], "result": task["result"]})
+    return task
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
@@ -317,6 +528,7 @@ def load_canonical_bundle(store: ProjectStore) -> list[dict[str, Any]]:
         jobs.extend(episode_jobs)
         expected_json.update(episode_paths)
 
+    expected_json.update(still_json_paths(store))
     actual_json = {
         path.resolve()
         for path in media_root.rglob("*.json")
@@ -364,10 +576,15 @@ def validate_locked_queue(store: ProjectStore, queue: dict[str, Any]) -> list[di
     if queue.get("manifests") != manifests:
         raise ValueError("canonical media-job manifest set changed after queue compilation; recompile")
     tasks = queue.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) != len(bundle):
-        raise ValueError("locked queue must contain exactly one task per manifest job")
+    still_items = load_still_bundle(store)
+    if not isinstance(tasks, list) or len(tasks) != len(still_items) + len(bundle):
+        raise ValueError("locked queue must contain exactly one task per still job and per manifest job")
+    still_ids: list[str] = []
+    for task, item in zip(tasks[: len(still_items)], still_items):
+        validate_still_task(store, task, item)
+        still_ids.append(task["id"])
     previous_id: str | None = None
-    for position, (task, item) in enumerate(zip(tasks, bundle), start=1):
+    for position, (task, item) in enumerate(zip(tasks[len(still_items):], bundle), start=1):
         if not isinstance(task, dict):
             raise ValueError(f"queue.tasks[{position - 1}] must be an object")
         job = item["job"]
@@ -379,7 +596,7 @@ def validate_locked_queue(store: ProjectStore, queue: dict[str, Any]) -> list[di
             "job_sha256": item["canonical_sha256"],
             "kind": "locked_media_job",
             "priority": 100 + position,
-            "depends_on": [previous_id] if previous_id else [],
+            "depends_on": [previous_id] if previous_id else list(still_ids),
             "max_attempts": int(job["retry_policy"]["max_attempts"]),
             "expected_path": job["outputs"]["video_path"],
             "accepted_extensions": [".mp4", ".mov", ".mkv", ".webm"],

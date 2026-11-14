@@ -13,10 +13,14 @@ from PIL import Image, ImageDraw
 
 from .media_contract_bridge import (
     EXECUTION_MODE,
+    STILL_KIND,
     canonical_manifest_records,
+    complete_still_task,
     lint_bound_receipt,
     load_canonical_bundle,
+    load_still_bundle,
     load_task_job,
+    still_task,
     task_payload_from_job,
     validate_locked_queue,
 )
@@ -53,7 +57,10 @@ def _compile_locked_queue(store: ProjectStore) -> dict[str, Any]:
     except Exception as exc:
         store.set_stage("compile", "failed", str(exc))
         raise
-    tasks: list[dict[str, Any]] = []
+    still_items = load_still_bundle(store)
+    tasks: list[dict[str, Any]] = [still_task(store, item) for item in still_items]
+    still_ids = [task["id"] for task in tasks]
+    still_count = len(tasks)
     previous_task_id: str | None = None
     for item in bundle:
         job = item["job"]
@@ -66,8 +73,8 @@ def _compile_locked_queue(store: ProjectStore) -> dict[str, Any]:
             "job_sha256": item["canonical_sha256"],
             "kind": "locked_media_job",
             "status": "pending",
-            "priority": 101 + len(tasks),
-            "depends_on": [previous_task_id] if previous_task_id else [],
+            "priority": 101 + len(tasks) - still_count,
+            "depends_on": [previous_task_id] if previous_task_id else list(still_ids),
             "attempts": 0,
             "max_attempts": int(job["retry_policy"]["max_attempts"]),
             "expected_path": job["outputs"]["video_path"],
@@ -239,6 +246,19 @@ def complete_task(
             f"Task {task_id} has incomplete dependencies: {sorted(missing_dependencies)}"
         )
     source = source.expanduser().resolve()
+    if task.get("kind") == STILL_KIND:
+        if mock:
+            raise ValueError("canonical locked_still_job tasks cannot use the mock completion path")
+        return complete_still_task(
+            store,
+            queue,
+            task,
+            source,
+            qc_passed=qc_passed,
+            note=note,
+            cost=cost,
+            receipt_path=receipt_path,
+        )
     probe = _validate_output(task, source)
     if task.get("kind") == "locked_media_job":
         if mock:
