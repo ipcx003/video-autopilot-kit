@@ -60,6 +60,15 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         candidate = fonts / name
         if candidate.is_file():
             return ImageFont.truetype(str(candidate), size=size)
+    # macOS and Linux have no WINDIR fonts; without this, Chinese captions render as boxes.
+    try:
+        from platform_compat import find_cjk_font
+
+        system_font = find_cjk_font(prefer=["Bold", "Medium"])
+        if system_font:
+            return ImageFont.truetype(system_font, size=size)
+    except (ImportError, OSError):
+        pass
     return ImageFont.load_default()
 
 
